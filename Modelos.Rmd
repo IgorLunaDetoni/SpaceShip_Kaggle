@@ -1,0 +1,314 @@
+---
+title: "Models"
+author: "Igor"
+date: "2023-01-19"
+output: html_document
+---
+
+```{r Libraries, include=FALSE, results='hide'}
+library(tidyverse)
+library(stringr)
+library(recipes)
+library(tibble)
+library(rsample)
+library(parsnip)
+library(tune)
+library(yardstick)
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+### Loading Data
+
+```{r Loading Data}
+train <- read.csv("train.csv")
+test<-read.csv("test.csv")
+sample_submission <- read.csv("sample_submission.csv")
+```
+
+### data Wrangling
+```{r, echo=FALSE}
+train$Cabin <- replace(train$Cabin, train$Cabin == "", "Unknown")
+
+train %>% 
+  group_by (Cabin) %>% 
+  count()
+x
+
+train[c("deck","num","side")]<- str_split_fixed(train$Cabin, "/", n =3)
+test[c("deck","num","side")]<- str_split_fixed(test$Cabin, "/", n =3)
+```
+
+
+### Tratando NAs
+```{r}
+train$side <- replace(train$side, train$side == "", "Unknown")
+train$deck <- replace(train$deck, train$deck == "", "Unknown")
+train$HomePlanet <- replace(train$HomePlanet, train$HomePlanet == "", "Unknown")
+train$CryoSleep <- replace(train$CryoSleep, train$CryoSleep == "", "Unknown")
+train$VIP <- replace(train$VIP, train$VIP == "", "Unknown")
+train$Destination <- replace(train$Destination, train$Destination == "", "Unknown")
+
+train[is.na(train)] = 0
+
+test$side <- replace(test$side, test$side == "", "Unknown")
+test$deck <- replace(test$deck, test$deck == "", "Unknown")
+test$HomePlanet <- replace(test$HomePlanet, test$HomePlanet == "", "Unknown")
+test$CryoSleep <- replace(test$CryoSleep, test$CryoSleep == "", "Unknown")
+test$VIP <- replace(test$VIP, test$VIP == "", "Unknown")
+test$Destination <- replace(test$Destination, test$Destination == "", "Unknown")
+
+test[is.na(test)] = 0
+
+t<-test
+```
+
+### Criando receitas para cross validation
+```{r}
+train<-as_tibble(train)
+recipe1 <- recipe(Transported ~ ., train) %>%
+  step_rm(c('num','PassengerId', "Name", "Cabin")) %>% 
+  step_normalize(c('FoodCourt','RoomService','ShoppingMall','Spa','VRDeck')) %>%
+  step_dummy('deck', 'side','HomePlanet','VIP',"CryoSleep","Destination") %>%
+  step_unknown(0) %>% 
+  prep()
+forbake <-prep(recipe1)
+train <- bake(forbake, new_data = NULL)
+test <- bake(forbake, new_data = test)
+```
+### Receita para grid e k folds
+
+```{r Receita 2 e Folds}
+# Receita e folds para Grid 
+set.seed(1234)
+receita2 <- recipe(Transported ~ ., train) %>% prep()
+
+cv_split <- vfold_cv(train, v = 5)
+
+```
+
+## Modelo XGBoost
+
+```{r XGBOOST}
+
+boost <-  boost_tree(tree_depth = tune(), trees = tune(), learn_rate = tune(), min_n = tune(), loss_reduction = tune()) %>%
+  set_engine('xgboost') %>%
+  set_mode('classification')
+
+```
+
+### Ajuste de hiperparâmetros
+
+```{r Grid Boost}
+set.seed(1234)
+doParallel::registerDoParallel()
+
+boost_grid <- tune_grid(boost, 
+                        receita2, 
+                        resamples = cv_split, 
+                        grid = 30, 
+                        metrics = metric_set(accuracy))
+
+
+```
+
+### Métricas Best boost
+
+```{r Métricas boost}
+set.seed(1234)
+boost_grid %>% 
+  collect_metrics() %>% 
+  head()
+best<-boost_grid %>% 
+  select_best('accuracy')
+
+```
+
+### Finalizando Boost e coletando os dados
+Vamos ver pra onde vai
+
+```{r Tibble fitting}
+set.seed(1234)
+boost_fit<- finalize_model(boost, parameters = best) %>% 
+  fit(Transported~., train)
+boost_fit
+
+```
+
+#### Fiting boost with test data
+
+```{r}
+
+Prediction1<-boost_fit %>%  
+  predict(new_data = test) %>% mutate(PassagerId = t$PassengerId)
+```
+
+```{r}
+PassengerId <- Prediction1$PassagerId
+Transported <- Prediction1$.pred_class
+Submission <- data.frame(PassengerId,Transported)
+
+write_csv(Submission,file = 'Submission.csv')
+```
+
+## Modelo de Floresta aleatória
+
+```{r Modelo de Floresta aleatória }
+
+set.seed(1234)
+rf2 <- rand_forest(mtry = tune(), trees = tune(), 
+                   min_n = tune()) %>% 
+  set_engine("ranger") %>% 
+  #set_args(keep.inbag = TRUE) %>% 
+  set_mode("classification")
+
+
+```
+
+### Tunning Floresta
+
+```{r Tunning Floresta aleatória }
+set.seed(1234)
+doParallel::registerDoParallel()
+
+rf_grid <- tune_grid(rf2, 
+                     receita2, #Porque pra cada lote do k folds ele vai precisar rodar a receita denovo 
+                     resamples = cv_split, #para rodar em cima do kfolds 
+                     grid = 20, 
+                     metrics = metric_set(accuracy))
+
+```
+
+## Predição Floresta Aleatória e Métricas
+
+### Finalização com melhores parâmetros
+
+```{r Métricas e predição }
+set.seed(1234)
+rf_grid %>% 
+  collect_metrics() %>% 
+  head()
+
+best<-rf_grid %>% 
+  select_best('accuracy')
+
+rf_fit2 <- finalize_model(rf2, parameters = best) %>% 
+  fit(Transported~., train)
+
+```
+
+#### Fiting Rand with test data
+
+```{r}
+
+Prediction1<-rf_fit2 %>%  
+  predict(new_data = test) %>% mutate(PassagerId = t$PassengerId)
+
+```
+
+
+```{r}
+PassengerId <- Prediction1$PassagerId
+Transported <- Prediction1$.pred_class
+Submission <- data.frame(PassengerId,Transported)
+
+write_csv(Submission,file = 'Submission_randf.csv')
+```
+
+
+## GLMnet
+
+```{r Modelo Regressao logística multinomial}
+set.seed(1234)
+
+logistic_reg_glm_spec <-
+  logistic_reg() %>%
+  set_engine('glm')
+
+
+
+
+
+boost_grid_glmnet <- tune_grid(logistic_reg_glm_spec, 
+                        receita2, 
+                        resamples = cv_split, 
+                        grid = 20, 
+                        metrics = metric_set(accuracy))
+```
+
+### Best Tunning GLM
+
+```{r Best tunning da GLM multinomial}
+
+boost_grid_glmnet %>% 
+  collect_metrics() %>% 
+  head()
+
+best_glm<-boost_grid_glmnet %>% 
+  select_best('accuracy')
+
+```
+
+### Finalização GLMnet
+
+```{r Finalização FIT}
+set.seed(1234)
+boost_fit_glm<-finalize_model(logistic_reg_glm_spec, parameters = best_glm) %>% 
+  fit(Transported~., train)
+
+Prediction2<-boost_fit_glm %>%  
+  predict(new_data = test) %>% mutate(PassagerId = t$PassengerId)
+
+PassengerId <- Prediction2$PassagerId
+Transported <- Prediction2$.pred_class
+Submission <- data.frame(PassengerId,Transported)
+
+write_csv(Submission,file = 'Submission_glm.csv')
+```
+
+#### SVM
+
+```{r}
+svm_poly_kernlab_spec <-
+  svm_poly(cost = tune(), degree = tune(), scale_factor = tune(), margin = tune()) %>%
+  set_engine('kernlab') %>%
+  set_mode('classification')
+
+boost_grid_svm <- tune_grid(svm_poly_kernlab_spec, 
+                        receita2, 
+                        resamples = cv_split, 
+                        grid = 20, 
+                        metrics = metric_set(accuracy, kap))
+
+```
+
+
+```{r}
+boost_grid_svm %>% 
+  collect_metrics() %>% 
+  head()
+
+best_svm<-boost_grid_svm %>% 
+  select_best('accuracy')
+
+
+```
+
+
+
+```{r}
+
+set.seed(1234)
+boost_fit_svm<-finalize_model(svm_poly_kernlab_spec, parameters = best_svm) %>% 
+  fit(Transported~., train)
+
+Prediction3<-boost_fit_svm %>%  
+  predict(new_data = test) %>% mutate(PassagerId = t$PassengerId)
+
+PassengerId <- Prediction3$PassagerId
+Transported <- Prediction3$.pred_class
+Submission <- data.frame(PassengerId,Transported)
+
+write_csv(Submission,file = 'Submission_svm.csv')
+```
+
